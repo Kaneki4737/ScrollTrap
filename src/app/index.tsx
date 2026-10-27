@@ -5,7 +5,11 @@ const { ScrollMonitor } = NativeModules;
 
 export default function Index() {
   const [stats, setStats] = useState({ screenTime: 0, punishments: 0 });
-  const [permissions, setPermissions] = useState({ hasOverlay: false, hasAccessibility: false });
+  const [permissions, setPermissions] = useState({
+    hasOverlay: false,
+    hasAccessibility: false,
+    hasBatteryExemption: false,
+  });
 
   const formatTime = (seconds: number) => {
     const h = Math.floor(seconds / 3600).toString().padStart(2, '0');
@@ -26,13 +30,8 @@ export default function Index() {
   };
 
   useEffect(() => {
-    // Initial sync
     syncData();
-
-    // Poll data every second while app is open
     const interval = setInterval(syncData, 1000);
-    
-    // Refresh heavily when app comes back to foreground
     const subscription = AppState.addEventListener('change', nextAppState => {
       if (nextAppState === 'active') syncData();
     });
@@ -43,10 +42,15 @@ export default function Index() {
     };
   }, []);
 
+  const allPermissionsGranted =
+    permissions.hasAccessibility &&
+    permissions.hasOverlay &&
+    permissions.hasBatteryExemption;
+
   return (
     <View style={styles.container}>
       <Text style={styles.title}>DoomScroll Trap</Text>
-      
+
       <View style={styles.card}>
         <Text style={styles.statLabel}>Screen Time Today</Text>
         <Text style={styles.statValue}>{formatTime(stats.screenTime)}</Text>
@@ -58,8 +62,8 @@ export default function Index() {
       </View>
 
       {!permissions.hasAccessibility && (
-        <TouchableOpacity 
-          style={styles.button} 
+        <TouchableOpacity
+          style={styles.button}
           onPress={() => ScrollMonitor.openAccessibilitySettings()}
         >
           <Text style={styles.buttonText}>1. Enable Accessibility Service</Text>
@@ -67,15 +71,24 @@ export default function Index() {
       )}
 
       {!permissions.hasOverlay && (
-        <TouchableOpacity 
-          style={[styles.button, styles.secondaryButton]} 
+        <TouchableOpacity
+          style={[styles.button, styles.secondaryButton]}
           onPress={() => ScrollMonitor.requestOverlayPermission()}
         >
           <Text style={styles.buttonText}>2. Enable Overlay Permission</Text>
         </TouchableOpacity>
       )}
 
-      {permissions.hasAccessibility && permissions.hasOverlay && (
+      {!permissions.hasBatteryExemption && (
+        <TouchableOpacity
+          style={[styles.button, styles.warningButton]}
+          onPress={() => ScrollMonitor.requestIgnoreBatteryOptimizations()}
+        >
+          <Text style={styles.buttonText}>3. Keep Service Alive (Battery)</Text>
+        </TouchableOpacity>
+      )}
+
+      {allPermissionsGranted && (
         <Text style={styles.activeText}>Monitoring is Active ✓</Text>
       )}
     </View>
@@ -124,6 +137,9 @@ const styles = StyleSheet.create({
   },
   secondaryButton: {
     backgroundColor: '#2196F3',
+  },
+  warningButton: {
+    backgroundColor: '#FF9800',
   },
   buttonText: {
     color: '#fff',
