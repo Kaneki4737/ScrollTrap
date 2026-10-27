@@ -17,6 +17,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
@@ -27,6 +28,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Telephony;
+import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -41,6 +43,7 @@ import android.widget.Toast;
 
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Random;
@@ -63,6 +66,13 @@ public class ScrollMonitorService extends AccessibilityService {
     private static final int PUNISHMENT_SPEAKER = 2;
 
     private final List<Integer> punishmentQueue = new ArrayList<>();
+    private final List<String> wallpaperQueue = new ArrayList<>();
+    private final List<String> soundQueue = new ArrayList<>();
+
+    private int lastPunishment = -1;
+    private String lastWallpaper = "";
+    private String lastSound = "";
+
     private final Random random = new Random();
     private final ExecutorService backgroundExecutor = Executors.newSingleThreadExecutor();
 
@@ -80,6 +90,7 @@ public class ScrollMonitorService extends AccessibilityService {
 
     private long emergencyLaunchGraceUntilMs = 0;
     private boolean hasEnteredEmergencyApp = false;
+    private long closingAppGraceUntilMs = 0;
 
     private MediaPlayer activeMediaPlayer;
     private boolean isPlayingPunishmentSound = false;
@@ -99,10 +110,13 @@ public class ScrollMonitorService extends AccessibilityService {
                         updateCountdownUI(remainingMs);
                         enforceLockScreen();
                     }
-                } else if (isTargetActive()) {
-                    screenTimeSeconds++;
-                    saveStats();
-                    checkPunishment();
+                } else {
+                    refreshYouTubeShortsState();
+                    if (isTargetActive()) {
+                        screenTimeSeconds++;
+                        saveStats();
+                        checkPunishment();
+                    }
                 }
             } catch (Exception ignored) {}
             timerHandler.postDelayed(this, 1000);
@@ -149,6 +163,7 @@ public class ScrollMonitorService extends AccessibilityService {
 
             screenTimeSeconds = prefs.getInt("screenTime", 0);
             punishmentsToday = prefs.getInt("punishments", 0);
+            loadQueuesState();
 
             startPersistentForegroundNotification();
 
@@ -220,6 +235,13 @@ public class ScrollMonitorService extends AccessibilityService {
                     return;
                 }
 
+                // Ignore transient events from YouTube/Instagram while stopPlaybackAndCloseApp() is minimizing them
+                if (System.currentTimeMillis() < closingAppGraceUntilMs &&
+                    ("com.google.android.youtube".equals(pkg) || "com.instagram.android".equals(pkg))) {
+                    isWatchingShorts = false;
+                    return;
+                }
+
                 if (!pkg.equals(getPackageName()) && !"com.android.systemui".equals(pkg)) {
                     currentPackage = pkg;
                 }
@@ -234,6 +256,8 @@ public class ScrollMonitorService extends AccessibilityService {
                 AccessibilityNodeInfo rootNode = getRootInActiveWindow();
                 if (rootNode != null) {
                     isWatchingShorts = checkShortsUI(rootNode);
+                } else {
+                    isWatchingShorts = false;
                 }
             } else {
                 isWatchingShorts = false;
@@ -253,37 +277,146 @@ public class ScrollMonitorService extends AccessibilityService {
         } catch (Exception ignored) {}
     }
 
-    private boolean checkShortsUI(AccessibilityNodeInfo node) {
-        if (node == null) return false;
+    private void refreshYouTubeShortsState() {
+        if (System.currentTimeMillis() < closingAppGraceUntilMs) {
+            isWatchingShorts = false;
+            return;
+        }
         try {
-            String viewId = node.getViewIdResourceName();
-            if (viewId != null) {
-                if (viewId.contains("reel_recycler") ||
-                    viewId.contains("reel_watch_player") ||
-                    viewId.contains("reel_player_page_container") ||
-                    viewId.contains("reel_time_bar") ||
-                    viewId.contains("shorts_player")) {
-                    return true;
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root != null && root.getPackageName() != null) {
+                String rootPkg = root.getPackageName().toString();
+                if (!rootPkg.equals(getPackageName()) && !"com.android.systemui".equals(rootPkg)) {
+                    currentPackage = rootPkg;
+                }
+                if ("com.google.android.youtube".equals(currentPackage)) {
+                    isWatchingShorts = checkShortsUI(root);
+                } else {
+                    isWatchingShorts = false;
                 }
             }
+        } catch (Exception ignored) {}
+    }
 
-            CharSequence contentDesc = node.getContentDescription();
-            if (contentDesc != null) {
-                String desc = contentDesc.toString();
-                if ((desc.equals("Shorts") && node.isSelected()) || desc.contains("Create a Short")) {
-                    return true;
+    private static class ShortsScanState {
+        boolean hasSelectedShortsTab = false;
+        boolean hasSelectedNonShortsTab = false;
+        boolean hasVisibleHomeFeed = false;
+        boolean hasVisibleShortsActiveElement = false;
+        boolean hasVisibleShortsContainer = false;
+    }
+
+    private boolean checkShortsUI(AccessibilityNodeInfo rootNode) {
+        if (rootNode == null) return false;
+        try {
+            DisplayMetrics metrics = new DisplayMetrics();
+            if (windowManager != null && windowManager.getDefaultDisplay() != null) {
+                windowManager.getDefaultDisplay().getRealMetrics(metrics);
+            } else {
+                metrics = getResources().getDisplayMetrics();
+            }
+            int screenWidth = metrics.widthPixels > 0 ? metrics.widthPixels : 1080;
+            int screenHeight = metrics.heightPixels > 0 ? metrics.heightPixels : 1920;
+
+            ShortsScanState state = new ShortsScanState();
+            scanShortsNodes(rootNode, state, screenWidth, screenHeight);
+
+            // 1. "Shorts" bottom navigation tab is actively selected and visible
+            if (state.hasSelectedShortsTab) {
+                return true;
+            }
+
+            // 2. Active Shorts player controls or full-screen scrollable reel_recycler are visibly on screen
+            //    (handles opening a Short directly from the Homepage Shorts shelf)
+            if (state.hasVisibleShortsActiveElement) {
+                return true;
+            }
+
+            // 3. Fallback container check only if not on the visible Home/Subscriptions/You feed
+            if (state.hasVisibleShortsContainer && !state.hasVisibleHomeFeed && !state.hasSelectedNonShortsTab) {
+                return true;
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    private void scanShortsNodes(AccessibilityNodeInfo node, ShortsScanState state, int screenWidth, int screenHeight) {
+        if (node == null) return;
+        try {
+            // Skip nodes that are hidden/cached in background fragments (fixes post-punishment homepage false positive)
+            if (node.isVisibleToUser()) {
+                Rect bounds = new Rect();
+                node.getBoundsInScreen(bounds);
+
+                int visibleLeft = Math.max(0, bounds.left);
+                int visibleTop = Math.max(0, bounds.top);
+                int visibleRight = Math.min(screenWidth, bounds.right);
+                int visibleBottom = Math.min(screenHeight, bounds.bottom);
+                int visibleWidth = Math.max(0, visibleRight - visibleLeft);
+                int visibleHeight = Math.max(0, visibleBottom - visibleTop);
+
+                if (visibleWidth > 0 && visibleHeight > 0) {
+                    boolean isFullscreenNode = visibleWidth >= (int) (screenWidth * 0.65f)
+                            && visibleHeight >= (int) (screenHeight * 0.55f);
+
+                    String viewId = node.getViewIdResourceName();
+                    if (viewId != null) {
+                        // Home feed filter chips bar ("All", "Gaming", etc.) only appears on Homepage
+                        if (viewId.contains("chip_cloud")) {
+                            state.hasVisibleHomeFeed = true;
+                        }
+
+                        // Active full-screen Shorts vertical pager
+                        if (viewId.contains("reel_recycler") || viewId.contains("shorts_player")) {
+                            if (isFullscreenNode && (node.isScrollable() || node.getChildCount() > 0)) {
+                                state.hasVisibleShortsActiveElement = true;
+                            }
+                        }
+
+                        // Active Shorts player overlay controls (hidden when on Homepage)
+                        if (viewId.contains("reel_time_bar") ||
+                            viewId.contains("reel_progress_bar") ||
+                            viewId.contains("reel_rhs_container") ||
+                            viewId.contains("reel_dyn_like") ||
+                            viewId.contains("reel_dyn_dislike") ||
+                            viewId.contains("reel_dyn_comment") ||
+                            viewId.contains("reel_dyn_share") ||
+                            viewId.contains("reel_player_header")) {
+                            state.hasVisibleShortsActiveElement = true;
+                        }
+
+                        // Outer Shorts player containers (only valid when full-screen)
+                        if (viewId.contains("reel_watch_player") ||
+                            viewId.contains("reel_player_page_container")) {
+                            if (isFullscreenNode) {
+                                state.hasVisibleShortsContainer = true;
+                            }
+                        }
+                    }
+
+                    CharSequence contentDesc = node.getContentDescription();
+                    if (contentDesc != null) {
+                        String desc = contentDesc.toString();
+                        if (desc.equals("Shorts") && node.isSelected()) {
+                            state.hasSelectedShortsTab = true;
+                        } else if ((desc.equals("Home") || desc.equals("Subscriptions") ||
+                                    desc.equals("You") || desc.equals("Library")) && node.isSelected()) {
+                            state.hasSelectedNonShortsTab = true;
+                        } else if (desc.contains("Create a Short")) {
+                            state.hasVisibleShortsActiveElement = true;
+                        }
+                    }
                 }
             }
 
             int count = node.getChildCount();
             for (int i = 0; i < count; i++) {
                 AccessibilityNodeInfo child = node.getChild(i);
-                if (child != null && checkShortsUI(child)) {
-                    return true;
+                if (child != null) {
+                    scanShortsNodes(child, state, screenWidth, screenHeight);
                 }
             }
         } catch (Exception ignored) {}
-        return false;
     }
 
     private boolean isTargetActive() {
@@ -300,20 +433,128 @@ public class ScrollMonitorService extends AccessibilityService {
     }
 
     // =========================================================================
+    // 🎲 NON-REPEATING SHUFFLE QUEUE HELPERS (Punishments, Wallpapers, Sounds)
+    // =========================================================================
+    private synchronized int getNextPunishment() {
+        if (punishmentQueue.isEmpty()) {
+            punishmentQueue.add(PUNISHMENT_OVERLAY);
+            punishmentQueue.add(PUNISHMENT_WALLPAPER);
+            punishmentQueue.add(PUNISHMENT_SPEAKER);
+            Collections.shuffle(punishmentQueue, random);
+
+            // Ensure the first punishment of the new cycle is never the same as the last punishment of the previous cycle
+            if (punishmentQueue.size() > 1 && punishmentQueue.get(0) == lastPunishment) {
+                int swapIndex = 1 + random.nextInt(punishmentQueue.size() - 1);
+                Collections.swap(punishmentQueue, 0, swapIndex);
+            }
+        }
+
+        int chosen = punishmentQueue.remove(0);
+        lastPunishment = chosen;
+        saveQueuesState();
+        return chosen;
+    }
+
+    private synchronized String getNextWallpaper(List<String> validImages) {
+        if (validImages == null || validImages.isEmpty()) return null;
+
+        // Keep only files that still exist in assets
+        wallpaperQueue.retainAll(validImages);
+
+        if (wallpaperQueue.isEmpty()) {
+            wallpaperQueue.addAll(validImages);
+            Collections.shuffle(wallpaperQueue, random);
+
+            // Prevent the first wallpaper of a new cycle from repeating the last wallpaper of the previous cycle
+            if (wallpaperQueue.size() > 1 && wallpaperQueue.get(0).equals(lastWallpaper)) {
+                int swapIndex = 1 + random.nextInt(wallpaperQueue.size() - 1);
+                Collections.swap(wallpaperQueue, 0, swapIndex);
+            }
+        }
+
+        String chosen = wallpaperQueue.remove(0);
+        lastWallpaper = chosen;
+        saveQueuesState();
+        return chosen;
+    }
+
+    private synchronized String getNextSound(List<String> validSounds) {
+        if (validSounds == null || validSounds.isEmpty()) return null;
+
+        // Keep only files that still exist in assets
+        soundQueue.retainAll(validSounds);
+
+        if (soundQueue.isEmpty()) {
+            soundQueue.addAll(validSounds);
+            Collections.shuffle(soundQueue, random);
+
+            // Prevent the first sound of a new cycle from repeating the last sound of the previous cycle
+            if (soundQueue.size() > 1 && soundQueue.get(0).equals(lastSound)) {
+                int swapIndex = 1 + random.nextInt(soundQueue.size() - 1);
+                Collections.swap(soundQueue, 0, swapIndex);
+            }
+        }
+
+        String chosen = soundQueue.remove(0);
+        lastSound = chosen;
+        saveQueuesState();
+        return chosen;
+    }
+
+    private synchronized void saveQueuesState() {
+        if (prefs == null) return;
+        List<String> pStrings = new ArrayList<>();
+        for (Integer p : punishmentQueue) {
+            pStrings.add(String.valueOf(p));
+        }
+        prefs.edit()
+            .putString("punishmentQueue", TextUtils.join("\n", pStrings))
+            .putInt("lastPunishment", lastPunishment)
+            .putString("wallpaperQueue", TextUtils.join("\n", wallpaperQueue))
+            .putString("lastWallpaper", lastWallpaper)
+            .putString("soundQueue", TextUtils.join("\n", soundQueue))
+            .putString("lastSound", lastSound)
+            .apply();
+    }
+
+    private synchronized void loadQueuesState() {
+        if (prefs == null) return;
+
+        lastPunishment = prefs.getInt("lastPunishment", -1);
+        lastWallpaper = prefs.getString("lastWallpaper", "");
+        lastSound = prefs.getString("lastSound", "");
+
+        punishmentQueue.clear();
+        String pRaw = prefs.getString("punishmentQueue", "");
+        if (!pRaw.isEmpty()) {
+            for (String part : pRaw.split("\n")) {
+                try {
+                    punishmentQueue.add(Integer.parseInt(part.trim()));
+                } catch (Exception ignored) {}
+            }
+        }
+
+        wallpaperQueue.clear();
+        String wRaw = prefs.getString("wallpaperQueue", "");
+        if (!wRaw.isEmpty()) {
+            wallpaperQueue.addAll(Arrays.asList(wRaw.split("\n")));
+        }
+
+        soundQueue.clear();
+        String sRaw = prefs.getString("soundQueue", "");
+        if (!sRaw.isEmpty()) {
+            soundQueue.addAll(Arrays.asList(sRaw.split("\n")));
+        }
+    }
+
+    // =========================================================================
     // 🎲 RANDOMIZED PUNISHMENT ENGINE
     // =========================================================================
     private void triggerRandomPunishment() {
         punishmentsToday++;
         saveStats();
 
-        if (punishmentQueue.isEmpty()) {
-            punishmentQueue.add(PUNISHMENT_OVERLAY);
-            punishmentQueue.add(PUNISHMENT_WALLPAPER);
-            punishmentQueue.add(PUNISHMENT_SPEAKER);
-            Collections.shuffle(punishmentQueue, random);
-        }
-
-        int chosenPunishment = punishmentQueue.remove(0);
+        int chosenPunishment = getNextPunishment();
 
         switch (chosenPunishment) {
             case PUNISHMENT_OVERLAY:
@@ -356,9 +597,9 @@ public class ScrollMonitorService extends AccessibilityService {
                     }
 
                     Bitmap bitmapToSet;
-                    if (!validImages.isEmpty()) {
-                        String randomImage = validImages.get(random.nextInt(validImages.size()));
-                        try (InputStream is = getAssets().open("wallpapers/" + randomImage)) {
+                    String nextImage = getNextWallpaper(validImages);
+                    if (nextImage != null) {
+                        try (InputStream is = getAssets().open("wallpapers/" + nextImage)) {
                             bitmapToSet = BitmapFactory.decodeStream(is);
                         }
                     } else {
@@ -430,9 +671,9 @@ public class ScrollMonitorService extends AccessibilityService {
                         .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                         .build());
 
-                if (!validSounds.isEmpty()) {
-                    String randomSound = validSounds.get(random.nextInt(validSounds.size()));
-                    AssetFileDescriptor afd = getAssets().openFd("sounds/" + randomSound);
+                String nextSound = getNextSound(validSounds);
+                if (nextSound != null) {
+                    AssetFileDescriptor afd = getAssets().openFd("sounds/" + nextSound);
                     activeMediaPlayer.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
                     afd.close();
                 } else {
@@ -497,11 +738,14 @@ public class ScrollMonitorService extends AccessibilityService {
         } catch (Exception ignored) {}
 
         // Exits YT Shorts player first so Picture-in-Picture (PiP) will not trigger
+        closingAppGraceUntilMs = System.currentTimeMillis() + 600;
         isWatchingShorts = false;
         currentPackage = "";
         performGlobalAction(GLOBAL_ACTION_BACK);
 
         timerHandler.postDelayed(() -> {
+            isWatchingShorts = false;
+            currentPackage = "";
             performGlobalAction(GLOBAL_ACTION_HOME);
             try {
                 ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);

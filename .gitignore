@@ -38,3 +38,8 @@ yarn-error.*
 
 example
 
+android/.gradle/
+android/build/
+android/app/build/
+*.keystore
+!debug.keystore
